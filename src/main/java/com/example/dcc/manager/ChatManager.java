@@ -11,7 +11,7 @@ public class ChatManager {
     private String playerUUID;
 
     public ChatManager() {
-        this.networkClient = new DiscordNetworkClient("http://localhost:8080"); // Backend server URL
+        this.networkClient = new DiscordNetworkClient("https://galaxiostwocool.com/chatsyncro");
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.player != null) {
             this.playerUUID = client.player.getUuidAsString();
