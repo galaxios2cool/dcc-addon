@@ -3,8 +3,12 @@ const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const { Client, GatewayIntentBits, ChannelType } = require('discord.js');
+const http = require('http');
+const WebSocket = require('ws');
 
 const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: '/ws' });
 
 // Middleware
 app.use(cors());
@@ -16,6 +20,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.MessageContent,
   ],
 });
 
@@ -24,7 +29,7 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const PORT = process.env.PORT || 3000;
 
-// Track connected players
+// Track connected players with WebSocket connections
 const connectedPlayers = new Map();
 
 // Discord bot ready event
@@ -32,31 +37,105 @@ client.on('ready', () => {
   console.log(`✅ Discord bot logged in as ${client.user.tag}`);
 });
 
+// Listen for messages from Discord
+client.on('messageCreate', async (message) => {
+  // Ignore bot messages
+  if (message.author.bot) return;
+  
+  // Only process messages in the configured channel
+  if (message.channelId !== CHANNEL_ID) return;
+
+  try {
+    console.log(`[DISCORD] ${message.author.username}: ${message.content}`);
+    
+    // Send message to all connected Minecraft players
+    const discordMessage = {
+      type: 'discord_message',
+      author: message.author.username,
+      content: message.content,
+      timestamp: new Date(),
+    };
+
+    broadcastToPlayers(discordMessage);
+  } catch (error) {
+    console.error('[DISCORD_MESSAGE_ERROR]', error);
+  }
+});
+
 // Login to Discord
 client.login(DISCORD_TOKEN);
+
+// ==================== WEBSOCKET HANDLING ====================
+
+wss.on('connection', (ws) => {
+  console.log('[WS] New WebSocket connection');
+
+  let playerUUID = null;
+
+  ws.on('message', (data) => {
+    try {
+      const message = JSON.parse(data);
+
+      if (message.type === 'connect') {
+        playerUUID = message.uuid;
+        connectedPlayers.set(playerUUID, {
+          uuid: playerUUID,
+          playerName: message.playerName,
+          ws,
+          connectedAt: new Date(),
+        });
+        console.log(`[WS_CONNECT] ${message.playerName} (${playerUUID})`);
+        ws.send(JSON.stringify({ type: 'connected', success: true }));
+      }
+    } catch (error) {
+      console.error('[WS_MESSAGE_ERROR]', error);
+    }
+  });
+
+  ws.on('close', () => {
+    if (playerUUID) {
+      connectedPlayers.delete(playerUUID);
+      console.log(`[WS_DISCONNECT] Player ${playerUUID} disconnected`);
+    }
+  });
+
+  ws.on('error', (error) => {
+    console.error('[WS_ERROR]', error);
+  });
+});
+
+// Broadcast message to all connected players
+function broadcastToPlayers(message) {
+  let count = 0;
+  connectedPlayers.forEach((player) => {
+    if (player.ws.readyState === WebSocket.OPEN) {
+      player.ws.send(JSON.stringify(message));
+      count++;
+    }
+  });
+  console.log(`[BROADCAST] Sent to ${count} players`);
+}
 
 // ==================== API ENDPOINTS ====================
 
 /**
  * POST /api/connect
- * Register a player connection
+ * Register a player connection (HTTP fallback)
  */
 app.post('/api/connect', (req, res) => {
   try {
-    const { uuid } = req.body;
+    const { uuid, playerName } = req.body;
 
-    if (!uuid) {
-      return res.status(400).json({ error: 'UUID is required' });
+    if (!uuid || !playerName) {
+      return res.status(400).json({ error: 'UUID and playerName are required' });
     }
 
-    // Track the player
-    connectedPlayers.set(uuid, {
-      uuid,
-      connectedAt: new Date(),
+    console.log(`[CONNECT] ${playerName} (${uuid})`);
+    res.status(200).json({ 
+      success: true, 
+      message: 'Connected to Discord chat',
+      wsUrl: `wss://${req.get('host')}/ws` // Send WebSocket URL to client
     });
-
-    console.log(`[CONNECT] Player connected: ${uuid}`);
-    res.status(200).json({ success: true, message: 'Connected to Discord chat' });
   } catch (error) {
     console.error('[CONNECT] Error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -65,7 +144,7 @@ app.post('/api/connect', (req, res) => {
 
 /**
  * POST /api/disconnect
- * Unregister a player connection
+ * Unregister a player connection (HTTP fallback)
  */
 app.post('/api/disconnect', (req, res) => {
   try {
@@ -75,10 +154,8 @@ app.post('/api/disconnect', (req, res) => {
       return res.status(400).json({ error: 'UUID is required' });
     }
 
-    // Remove the player from tracking
     connectedPlayers.delete(uuid);
-
-    console.log(`[DISCONNECT] Player disconnected: ${uuid}`);
+    console.log(`[DISCONNECT] Player ${uuid} disconnected`);
     res.status(200).json({ success: true, message: 'Disconnected from Discord chat' });
   } catch (error) {
     console.error('[DISCONNECT] Error:', error);
@@ -88,7 +165,7 @@ app.post('/api/disconnect', (req, res) => {
 
 /**
  * POST /api/message
- * Relay a message from Minecraft to Discord
+ * Relay a message from Minecraft to Discord and other players
  */
 app.post('/api/message', async (req, res) => {
   try {
@@ -135,15 +212,24 @@ app.post('/api/message', async (req, res) => {
       ],
     });
 
+    // Also broadcast to other connected Minecraft players
+    const minecraftMessage = {
+      type: 'minecraft_message',
+      author: playerName,
+      content: message,
+      timestamp: new Date(),
+    };
+    broadcastToPlayers(minecraftMessage);
+
     console.log(`[MESSAGE] ${playerName}: ${message}`);
     res.status(200).json({ 
       success: true, 
       messageId: discordMessage.id,
-      message: 'Message sent to Discord' 
+      message: 'Message sent to Discord and other players' 
     });
   } catch (error) {
     console.error('[MESSAGE] Error:', error);
-    res.status(500).json({ error: 'Failed to send message to Discord' });
+    res.status(500).json({ error: 'Failed to send message' });
   }
 });
 
@@ -168,6 +254,7 @@ app.get('/api/status', (req, res) => {
 app.get('/api/players', (req, res) => {
   const players = Array.from(connectedPlayers.values()).map(player => ({
     uuid: player.uuid,
+    playerName: player.playerName,
     connectedAt: player.connectedAt,
   }));
 
@@ -191,9 +278,10 @@ app.use((err, req, res, next) => {
 
 // ==================== START SERVER ====================
 
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`🚀 ChatSyncro backend running on port ${PORT}`);
-  console.log(`📍 API endpoint: http://localhost:${PORT}`);
+  console.log(`📍 HTTP endpoint: http://localhost:${PORT}`);
+  console.log(`🔌 WebSocket endpoint: ws://localhost:${PORT}/ws`);
   console.log(`📋 Connected players: /api/players`);
   console.log(`✨ Status: /api/status`);
 });
@@ -202,5 +290,6 @@ app.listen(PORT, () => {
 process.on('SIGINT', () => {
   console.log('\n🛑 Shutting down...');
   client.destroy();
+  server.close();
   process.exit(0);
 });
